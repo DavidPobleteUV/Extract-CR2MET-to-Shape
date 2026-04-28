@@ -35,13 +35,13 @@ getwd()
 ###########################################################################################
 ################## IMPORTANTE, LLENAR CON INFORMACION DE TU CUENCA ##################
 ###########################################################################################
-cuenca_nombre    <- "Quilimari"       # nombre de la cuenca para el nombre de archivo
-archivo_shp      <- "Quilimari_WEAP.shp"
+cuenca_nombre    <- "Aconcagua_Chacabuquito"       # nombre de la cuenca para el nombre de archivo
+archivo_shp      <- "polygon.shp"
 cuenca_shp       <- file.path(getwd(), "Cuenca", cuenca_nombre, archivo_shp)
-nombre_subcuenca <- "Name"            # columna con el nombre de cada subcuenca
+nombre_subcuenca <- "layer"            # columna con el nombre de cada subcuenca
 
 # Rango temporal
-years_to_keep  <- 1970:2025
+years_to_keep  <- 2023:2025
 months_to_keep <- NULL  # NULL = todos los meses; ej. c(9,10,11,12,1,2,3) para SONDJFM
 
 # Etiquetas dinámicas para nombres de archivo de salida
@@ -218,8 +218,19 @@ if (is.na(st_crs(shp))) {
   bb <- st_bbox(shp)
   looks_lonlat <- max(abs(c(bb["xmin"], bb["xmax"]))) <= 180 &&
                   max(abs(c(bb["ymin"], bb["ymax"]))) <= 90
-  st_crs(shp) <- if (looks_lonlat) 4326 else 32719  # ajusta 32719 si no es UTM 19S
-  cat("⚠ CRS ausente: se asignó", ifelse(looks_lonlat, "EPSG:4326", "EPSG:32719"), "\n")
+  if (looks_lonlat) {
+    st_crs(shp) <- 4326
+    cat("⚠ CRS ausente: se asignó EPSG:4326\n")
+  } else {
+    # Heurística: asumir UTM hemisferio sur, zona inferida del centro X.
+    # Ajustar manualmente si la cuenca está en otro contexto.
+    cx <- mean(c(bb["xmin"], bb["xmax"]))
+    # Para coords proyectadas no podemos inferir zona desde X directamente;
+    # usamos 19S por defecto pero advertimos.
+    st_crs(shp) <- 32719
+    cat("⚠ CRS ausente y coords no parecen lon/lat: se asignó EPSG:32719 (UTM 19S).\n",
+        "  Si tu cuenca no está en zona 19S, edita manualmente este bloque.\n", sep = "")
+  }
 }
 
 # Reparación pre-dissolve
@@ -231,10 +242,10 @@ shp <- .clean_sf_basic(shp)
 # 3.2 Dissolve robusto por subcuenca
 # ============================================================
 
-# Apagar S2 durante operaciones topológicas
+# Apagar S2 durante operaciones topológicas (se restaura al final del chunk).
+# Nota: on.exit() no aplica dentro de un chunk Rmd — restauramos explícitamente.
 old_s2 <- sf::sf_use_s2()
 sf::sf_use_s2(FALSE)
-on.exit(sf::sf_use_s2(old_s2), add = TRUE)
 
 if (nombre_subcuenca %in% names(shp)) {
 
@@ -296,6 +307,9 @@ shp_mejorado_path <- file.path(
 sf::st_write(shp, shp_mejorado_path, delete_layer = TRUE, quiet = TRUE)
 cat("✅ Shapefile reparado guardado en:", shp_mejorado_path, "\n")
 
+# Restaurar configuración previa de S2
+sf::sf_use_s2(old_s2)
+
 ```
 
 Función de extracción
@@ -328,25 +342,37 @@ fn_extract_from_nc <- function(nc_i, sf_i, var, original_filename) {
   }
   v <- terra::vect(sf_i)
 
-  # 4) Extraer media sobre el polígono
-  vals <- terra::extract(r, v, fun = mean, na.rm = TRUE, ID = FALSE)
+  # 4) Extraer media areal PONDERADA POR FRACCIÓN DE ÁREA de cada celda
+  #    exact = TRUE usa la fracción exacta de cada celda cubierta por el
+  #    polígono (no la regla "centroid-in"). Crítico para cuencas chicas
+  #    o con gradiente orográfico donde los bordes pesan distinto.
+  vals <- terra::extract(r, v, fun = mean, na.rm = TRUE,
+                         exact = TRUE, ID = FALSE)
 
-  # 5) Parsear AÑO y MES desde el nombre original del archivo
-  m  <- regexec("_(\\d{4})_(\\d{2})_005deg\\.nc$", original_filename)
-  mm <- regmatches(original_filename, m)[[1]]
-  if (length(mm) != 3) {
-    stop(paste0("No se pudo parsear año/mes del nombre de archivo: ", original_filename))
-  }
-  year  <- as.integer(mm[2])
-  month <- as.integer(mm[3])
-
-  # 6) Construir secuencia de fechas diarias
+  # 5) Fechas: preferir el time(r) del NetCDF; si no está, fallback al
+  #    nombre de archivo (CR2MET_*_YYYY_MM_005deg.nc, días consecutivos
+  #    desde el día 1).
   n_layers <- terra::nlyr(r)
-  fechas <- seq.Date(
-    from       = as.Date(sprintf("%04d-%02d-01", year, month)),
-    by         = "1 day",
-    length.out = n_layers
-  )
+  t_raster <- try(terra::time(r), silent = TRUE)
+
+  if (!inherits(t_raster, "try-error") &&
+      length(t_raster) == n_layers &&
+      all(!is.na(t_raster))) {
+    fechas <- as.Date(t_raster)
+  } else {
+    m  <- regexec("_(\\d{4})_(\\d{2})_005deg\\.nc$", original_filename)
+    mm <- regmatches(original_filename, m)[[1]]
+    if (length(mm) != 3) {
+      stop(paste0("No se pudo parsear año/mes del nombre de archivo: ", original_filename))
+    }
+    year  <- as.integer(mm[2])
+    month <- as.integer(mm[3])
+    fechas <- seq.Date(
+      from       = as.Date(sprintf("%04d-%02d-01", year, month)),
+      by         = "1 day",
+      length.out = n_layers
+    )
+  }
 
   # 7) Tabla de salida
   out <- tibble::tibble(
@@ -366,7 +392,7 @@ fn_extract_from_nc <- function(nc_i, sf_i, var, original_filename) {
 
 ```
 
-Compilación de la extracción a formato tbl
+Compilación de la extracción a formato CSV usable en WEAP
 ```{r}
 ############################################################
 # 5. Bucle principal: descargar → extraer en todos los polígonos → borrar
@@ -380,6 +406,36 @@ et0_remote  <- list_remote_nc_files(LIST_URL_ET0)  %>% filter_by_year_month(year
 cat("Archivos a procesar — PR:", nrow(pr_remote),
     "| TEMP:", nrow(temp_remote),
     "| ET0:", nrow(et0_remote), "\n")
+
+# 5.1b Caché local de NetCDF para evitar re-descargas en re-ejecuciones
+nc_cache_dir <- file.path(getwd(), "nc_cache")
+dir.create(nc_cache_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Descarga con caché: devuelve la ruta local o NULL si falla.
+# Subdirectorio por variable para evitar colisiones entre pr/txn/et0.
+download_nc_cached <- function(url, filename, subdir) {
+  cache_subdir <- file.path(nc_cache_dir, subdir)
+  dir.create(cache_subdir, recursive = TRUE, showWarnings = FALSE)
+  local_path <- file.path(cache_subdir, filename)
+
+  if (file.exists(local_path) && file.info(local_path)$size > 0) {
+    return(local_path)
+  }
+
+  ok <- tryCatch({
+    utils::download.file(url, destfile = local_path, mode = "wb", quiet = TRUE)
+    TRUE
+  }, error = function(e) {
+    cat("  ⚠ Error al descargar:", filename, "—", conditionMessage(e), "\n")
+    FALSE
+  })
+
+  if (!ok || !file.exists(local_path) || file.info(local_path)$size == 0) {
+    if (file.exists(local_path)) unlink(local_path)
+    return(NULL)
+  }
+  local_path
+}
 
 # 5.2 Listas acumuladoras
 res_pr_all   <- list()
@@ -398,26 +454,19 @@ for (i in seq_len(nrow(pr_remote))) {
   this_url  <- pr_remote$url[i]
   cat("  [", i, "/", nrow(pr_remote), "]", this_file, "\n")
 
-  tmp_nc <- tempfile(fileext = ".nc")
-  ok <- tryCatch({
-    utils::download.file(this_url, destfile = tmp_nc, mode = "wb", quiet = TRUE)
-    TRUE
-  }, error = function(e) {
-    cat("  ⚠ Error al descargar:", this_file, "— se omite.\n"); FALSE
-  })
-  if (!ok) { unlink(tmp_nc); next }
+  nc_path <- download_nc_cached(this_url, this_file, subdir = "pr")
+  if (is.null(nc_path)) next
 
   res_lista <- vector("list", length = nrow(shp))
   for (j in seq_len(nrow(shp))) {
     res_lista[[j]] <- tryCatch(
-      fn_extract_from_nc(tmp_nc, shp[j, ], var = "pr", original_filename = this_file),
+      fn_extract_from_nc(nc_path, shp[j, ], var = "pr", original_filename = this_file),
       error = function(e) {
         cat("  ⚠ Error polígono", shp$Subcuenca[j], ":", conditionMessage(e), "\n"); NULL
       }
     )
   }
   res_pr_all[[i]] <- bind_rows(res_lista)
-  unlink(tmp_nc)
 }
 
 tbl_pr <- bind_rows(res_pr_all)
@@ -434,19 +483,13 @@ for (i in seq_len(nrow(temp_remote))) {
   this_url  <- temp_remote$url[i]
   cat("  [", i, "/", nrow(temp_remote), "]", this_file, "\n")
 
-  tmp_nc <- tempfile(fileext = ".nc")
-  ok <- tryCatch({
-    utils::download.file(this_url, destfile = tmp_nc, mode = "wb", quiet = TRUE)
-    TRUE
-  }, error = function(e) {
-    cat("  ⚠ Error al descargar:", this_file, "— se omite.\n"); FALSE
-  })
-  if (!ok) { unlink(tmp_nc); next }
+  nc_path <- download_nc_cached(this_url, this_file, subdir = "txn")
+  if (is.null(nc_path)) next
 
   for (j in seq_len(nrow(shp))) {
 
     res_tn <- tryCatch(
-      fn_extract_from_nc(tmp_nc, shp[j, ], var = "tmin", original_filename = this_file),
+      fn_extract_from_nc(nc_path, shp[j, ], var = "tmin", original_filename = this_file),
       error = function(e) {
         cat("  ⚠ Error tmin polígono", shp$Subcuenca[j], ":", conditionMessage(e), "\n"); NULL
       }
@@ -457,7 +500,7 @@ for (i in seq_len(nrow(temp_remote))) {
     }
 
     res_tx <- tryCatch(
-      fn_extract_from_nc(tmp_nc, shp[j, ], var = "tmax", original_filename = this_file),
+      fn_extract_from_nc(nc_path, shp[j, ], var = "tmax", original_filename = this_file),
       error = function(e) {
         cat("  ⚠ Error tmax polígono", shp$Subcuenca[j], ":", conditionMessage(e), "\n"); NULL
       }
@@ -467,8 +510,6 @@ for (i in seq_len(nrow(temp_remote))) {
       res_tmax_all[[length(res_tmax_all) + 1]] <- res_tx
     }
   }
-
-  unlink(tmp_nc)
 }
 
 tbl_temp_min <- bind_rows(res_tmin_all)
@@ -486,26 +527,19 @@ for (i in seq_len(nrow(et0_remote))) {
   this_url  <- et0_remote$url[i]
   cat("  [", i, "/", nrow(et0_remote), "]", this_file, "\n")
 
-  tmp_nc <- tempfile(fileext = ".nc")
-  ok <- tryCatch({
-    utils::download.file(this_url, destfile = tmp_nc, mode = "wb", quiet = TRUE)
-    TRUE
-  }, error = function(e) {
-    cat("  ⚠ Error al descargar:", this_file, "— se omite.\n"); FALSE
-  })
-  if (!ok) { unlink(tmp_nc); next }
+  nc_path <- download_nc_cached(this_url, this_file, subdir = "et0")
+  if (is.null(nc_path)) next
 
   res_lista <- vector("list", length = nrow(shp))
   for (j in seq_len(nrow(shp))) {
     res_lista[[j]] <- tryCatch(
-      fn_extract_from_nc(tmp_nc, shp[j, ], var = "et0", original_filename = this_file),
+      fn_extract_from_nc(nc_path, shp[j, ], var = "et0", original_filename = this_file),
       error = function(e) {
         cat("  ⚠ Error polígono", shp$Subcuenca[j], ":", conditionMessage(e), "\n"); NULL
       }
     )
   }
   res_et0_all[[i]] <- bind_rows(res_lista)
-  unlink(tmp_nc)
 }
 
 tbl_et0 <- bind_rows(res_et0_all)
