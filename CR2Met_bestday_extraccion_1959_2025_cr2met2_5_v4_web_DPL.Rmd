@@ -35,14 +35,19 @@ getwd()
 ###########################################################################################
 ################## IMPORTANTE, LLENAR CON INFORMACION DE TU CUENCA ##################
 ###########################################################################################
-cuenca_nombre    <- "Aconcagua_Chacabuquito"       # nombre de la cuenca para el nombre de archivo
-archivo_shp      <- "polygon.shp"
+cuenca_nombre    <- "Aconcagua_EmbCatemu"       # nombre de la cuenca para el nombre de archivo
+archivo_shp      <- "Aconcagua_EmbCatemu.shp"
 cuenca_shp       <- file.path(getwd(), "Cuenca", cuenca_nombre, archivo_shp)
-nombre_subcuenca <- "layer"            # columna con el nombre de cada subcuenca
+nombre_subcuenca <- "HRU"            # columna con el nombre de cada subcuenca
 
 # Rango temporal
-years_to_keep  <- 2023:2025
+years_to_keep  <- 1975:2026
 months_to_keep <- NULL  # NULL = todos los meses; ej. c(9,10,11,12,1,2,3) para SONDJFM
+
+# Manejo de archivos NetCDF descargados:
+#   TRUE  = mantener en nc_cache/ (default; re-ejecuciones no re-descargan)
+#   FALSE = borrar cada .nc apenas se termina de procesar (libera disco)
+mantener_nc_cache <- TRUE
 
 # Etiquetas dinámicas para nombres de archivo de salida
 year_start_label <- min(years_to_keep)
@@ -437,6 +442,40 @@ download_nc_cached <- function(url, filename, subdir) {
   local_path
 }
 
+# 5.1c Infraestructura de exportación (se usa al terminar cada variable)
+dir_out <- file.path(getwd(), "Results", cuenca_nombre)
+dir.create(dir_out, recursive = TRUE, showWarnings = FALSE)
+
+.out <- function(sufijo) {
+  file.path(dir_out, paste0(cuenca_nombre, "_", sufijo,
+                            "_cr2met2.5_", year_start_label, "_", year_end_label, ".csv"))
+}
+
+# Exportación formato WEAP/DPL (archivos diarios)
+export_custom_format <- function(df, file_path) {
+  df <- df %>% dplyr::select(-any_of(c("año", "mes", "dia")))
+  df <- df %>% mutate(across(1, ~ format(as.Date(.), "%m/%d/%Y")))
+  line1 <- paste0("#,", paste(seq_len(ncol(df) - 1), collapse = ","))
+  line2 <- paste0("$Columns = ", paste(names(df), collapse = ","))
+  con <- file(file_path, "w", encoding = "UTF-8")
+  writeLines(c(line1, line2), con)
+  close(con)
+  write.table(df, file_path, sep = ",", row.names = FALSE,
+              col.names = FALSE, quote = FALSE, append = TRUE)
+}
+
+# Helpers de pivot largo → ancho
+.pivot_diario <- function(long) {
+  long %>% dplyr::select(fecha, Subcuenca, valor) %>%
+    tidyr::pivot_wider(names_from = Subcuenca, values_from = valor) %>%
+    dplyr::arrange(fecha)
+}
+.pivot_mensual <- function(long, valcol) {
+  long %>% dplyr::select(fecha, Subcuenca, dplyr::all_of(valcol)) %>%
+    tidyr::pivot_wider(names_from = Subcuenca, values_from = dplyr::all_of(valcol)) %>%
+    dplyr::arrange(fecha)
+}
+
 # 5.2 Listas acumuladoras
 res_pr_all   <- list()
 res_tmin_all <- list()
@@ -467,10 +506,27 @@ for (i in seq_len(nrow(pr_remote))) {
     )
   }
   res_pr_all[[i]] <- bind_rows(res_lista)
+  if (!mantener_nc_cache) unlink(nc_path)
 }
 
 tbl_pr <- bind_rows(res_pr_all)
 cat("✅ Precipitación lista:", nrow(tbl_pr), "filas.\n")
+
+# --- Agregar y EXPORTAR precipitación inmediatamente ---
+pr_diaria_long <- tbl_pr %>%
+  dplyr::group_by(Subcuenca, fecha, año, mes, dia) %>%
+  dplyr::summarise(valor = sum(valor, na.rm = TRUE), .groups = "drop")
+pr_diaria_resumen <- .pivot_diario(pr_diaria_long)
+
+pr_month_long <- tbl_pr %>%
+  dplyr::group_by(Subcuenca, año, mes) %>%
+  dplyr::summarise(pp_mon = sum(valor, na.rm = TRUE), .groups = "drop") %>%
+  dplyr::mutate(fecha = as.Date(paste(año, mes, "01", sep = "-")))
+pr_month_resumen <- .pivot_mensual(pr_month_long, "pp_mon")
+
+export_custom_format(pr_diaria_resumen, .out("pp_diaria"))
+write.csv(pr_month_resumen, .out("pp_mensual"), row.names = FALSE)
+cat("💾 Precipitación exportada a CSV.\n")
 
 ############################################################
 # 5B. Temperatura (tmin y tmax en el mismo NetCDF)
@@ -510,11 +566,49 @@ for (i in seq_len(nrow(temp_remote))) {
       res_tmax_all[[length(res_tmax_all) + 1]] <- res_tx
     }
   }
+  if (!mantener_nc_cache) unlink(nc_path)
 }
 
 tbl_temp_min <- bind_rows(res_tmin_all)
 tbl_temp_max <- bind_rows(res_tmax_all)
 cat("✅ Tmin lista:", nrow(tbl_temp_min), "filas. Tmax lista:", nrow(tbl_temp_max), "filas.\n")
+
+# --- Agregar y EXPORTAR tmin / tmax / tmean inmediatamente ---
+tmin_diaria_long <- tbl_temp_min %>%
+  dplyr::group_by(Subcuenca, fecha, año, mes, dia) %>%
+  dplyr::summarise(valor = mean(valor, na.rm = TRUE), .groups = "drop")
+tmin_month_long <- tbl_temp_min %>%
+  dplyr::group_by(Subcuenca, año, mes) %>%
+  dplyr::summarise(tmin_mon = mean(valor, na.rm = TRUE), .groups = "drop") %>%
+  dplyr::mutate(fecha = as.Date(paste(año, mes, "01", sep = "-")))
+
+tmax_diaria_long <- tbl_temp_max %>%
+  dplyr::group_by(Subcuenca, fecha, año, mes, dia) %>%
+  dplyr::summarise(valor = mean(valor, na.rm = TRUE), .groups = "drop")
+tmax_month_long <- tbl_temp_max %>%
+  dplyr::group_by(Subcuenca, año, mes) %>%
+  dplyr::summarise(tmax_mon = mean(valor, na.rm = TRUE), .groups = "drop") %>%
+  dplyr::mutate(fecha = as.Date(paste(año, mes, "01", sep = "-")))
+
+# Temperatura media = (tmin + tmax) / 2
+tmean_diaria_long <- tmin_diaria_long %>%
+  rename(valor_tmin = valor) %>%
+  inner_join(tmax_diaria_long %>% rename(valor_tmax = valor),
+             by = c("Subcuenca", "fecha", "año", "mes", "dia")) %>%
+  dplyr::mutate(valor = (valor_tmin + valor_tmax) / 2) %>%
+  dplyr::select(Subcuenca, fecha, año, mes, dia, valor)
+tmean_month_long <- tmean_diaria_long %>%
+  dplyr::group_by(Subcuenca, año, mes) %>%
+  dplyr::summarise(tmean_mon = mean(valor, na.rm = TRUE), .groups = "drop") %>%
+  dplyr::mutate(fecha = as.Date(paste(año, mes, "01", sep = "-")))
+
+export_custom_format(.pivot_diario(tmin_diaria_long),  .out("tn_diaria"))
+write.csv(.pivot_mensual(tmin_month_long, "tmin_mon"), .out("tn_mensual"), row.names = FALSE)
+export_custom_format(.pivot_diario(tmax_diaria_long),  .out("tx_diaria"))
+write.csv(.pivot_mensual(tmax_month_long, "tmax_mon"), .out("tx_mensual"), row.names = FALSE)
+export_custom_format(.pivot_diario(tmean_diaria_long), .out("tav_diaria"))
+write.csv(.pivot_mensual(tmean_month_long, "tmean_mon"), .out("tav_mensual"), row.names = FALSE)
+cat("💾 Temperatura (tmin/tmax/tmean) exportada a CSV.\n")
 
 ############################################################
 # 5C. ET0
@@ -540,198 +634,33 @@ for (i in seq_len(nrow(et0_remote))) {
     )
   }
   res_et0_all[[i]] <- bind_rows(res_lista)
+  if (!mantener_nc_cache) unlink(nc_path)
 }
 
 tbl_et0 <- bind_rows(res_et0_all)
 cat("✅ ET0 lista:", nrow(tbl_et0), "filas.\n")
 
-```
-
-Agregación de datos a nivel diario/mensual
-```{r}
-############################################################
-# 6. Agregaciones diarias y mensuales
-############################################################
-
-# --- 6.1 Precipitación diaria (largo → ancho) ---
-pr_diaria_long <- tbl_pr %>%
-  dplyr::group_by(Subcuenca, fecha, año, mes, dia) %>%
-  dplyr::summarise(valor = sum(valor, na.rm = TRUE), .groups = "drop")
-
-pr_diaria_resumen <- pr_diaria_long %>%
-  dplyr::select(fecha, Subcuenca, valor) %>%
-  tidyr::pivot_wider(names_from = Subcuenca, values_from = valor) %>%
-  dplyr::arrange(fecha)
-
-# --- 6.2 Precipitación mensual ---
-pr_month_long <- tbl_pr %>%
-  dplyr::group_by(Subcuenca, año, mes) %>%
-  dplyr::summarise(pp_mon = sum(valor, na.rm = TRUE), .groups = "drop") %>%
-  dplyr::mutate(fecha = as.Date(paste(año, mes, "01", sep = "-")))
-
-pr_month_resumen <- pr_month_long %>%
-  dplyr::select(fecha, Subcuenca, pp_mon) %>%
-  tidyr::pivot_wider(names_from = Subcuenca, values_from = pp_mon) %>%
-  dplyr::arrange(fecha)
-
-# --- 6.3 Temperatura mínima diaria y mensual ---
-tmin_diaria_long <- tbl_temp_min %>%
-  dplyr::group_by(Subcuenca, fecha, año, mes, dia) %>%
-  dplyr::summarise(valor = mean(valor, na.rm = TRUE), .groups = "drop")
-
-tmin_diaria_resumen <- tmin_diaria_long %>%
-  dplyr::select(fecha, Subcuenca, valor) %>%
-  tidyr::pivot_wider(names_from = Subcuenca, values_from = valor) %>%
-  dplyr::arrange(fecha)
-
-tmin_month_long <- tbl_temp_min %>%
-  dplyr::group_by(Subcuenca, año, mes) %>%
-  dplyr::summarise(tmin_mon = mean(valor, na.rm = TRUE), .groups = "drop") %>%
-  dplyr::mutate(fecha = as.Date(paste(año, mes, "01", sep = "-")))
-
-tmin_month_resumen <- tmin_month_long %>%
-  dplyr::select(fecha, Subcuenca, tmin_mon) %>%
-  tidyr::pivot_wider(names_from = Subcuenca, values_from = tmin_mon) %>%
-  dplyr::arrange(fecha)
-
-# --- 6.4 Temperatura máxima diaria y mensual ---
-tmax_diaria_long <- tbl_temp_max %>%
-  dplyr::group_by(Subcuenca, fecha, año, mes, dia) %>%
-  dplyr::summarise(valor = mean(valor, na.rm = TRUE), .groups = "drop")
-
-tmax_diaria_resumen <- tmax_diaria_long %>%
-  dplyr::select(fecha, Subcuenca, valor) %>%
-  tidyr::pivot_wider(names_from = Subcuenca, values_from = valor) %>%
-  dplyr::arrange(fecha)
-
-tmax_month_long <- tbl_temp_max %>%
-  dplyr::group_by(Subcuenca, año, mes) %>%
-  dplyr::summarise(tmax_mon = mean(valor, na.rm = TRUE), .groups = "drop") %>%
-  dplyr::mutate(fecha = as.Date(paste(año, mes, "01", sep = "-")))
-
-tmax_month_resumen <- tmax_month_long %>%
-  dplyr::select(fecha, Subcuenca, tmax_mon) %>%
-  tidyr::pivot_wider(names_from = Subcuenca, values_from = tmax_mon) %>%
-  dplyr::arrange(fecha)
-
-# --- 6.5 Temperatura media (promedio Tmin + Tmax) ---
-tmean_diaria_long <- tmin_diaria_long %>%
-  rename(valor_tmin = valor) %>%
-  inner_join(
-    tmax_diaria_long %>% rename(valor_tmax = valor),
-    by = c("Subcuenca", "fecha", "año", "mes", "dia")
-  ) %>%
-  dplyr::mutate(valor = (valor_tmin + valor_tmax) / 2) %>%
-  dplyr::select(Subcuenca, fecha, año, mes, dia, valor)
-
-tmean_diaria_resumen <- tmean_diaria_long %>%
-  dplyr::select(fecha, Subcuenca, valor) %>%
-  tidyr::pivot_wider(names_from = Subcuenca, values_from = valor) %>%
-  dplyr::arrange(fecha)
-
-tmean_month_long <- tmean_diaria_long %>%
-  dplyr::group_by(Subcuenca, año, mes) %>%
-  dplyr::summarise(tmean_mon = mean(valor, na.rm = TRUE), .groups = "drop") %>%
-  dplyr::mutate(fecha = as.Date(paste(año, mes, "01", sep = "-")))
-
-tmean_month_resumen <- tmean_month_long %>%
-  dplyr::select(fecha, Subcuenca, tmean_mon) %>%
-  tidyr::pivot_wider(names_from = Subcuenca, values_from = tmean_mon) %>%
-  dplyr::arrange(fecha)
-
-# --- 6.6 ET0 diaria ---
+# --- Agregar y EXPORTAR ET0 inmediatamente ---
 et0_diaria_long <- tbl_et0 %>%
   dplyr::group_by(Subcuenca, fecha, año, mes, dia) %>%
   dplyr::summarise(valor = sum(valor, na.rm = TRUE), .groups = "drop")
-
-et0_diaria_resumen <- et0_diaria_long %>%
-  dplyr::select(fecha, Subcuenca, valor) %>%
-  tidyr::pivot_wider(names_from = Subcuenca, values_from = valor) %>%
-  dplyr::arrange(fecha)
-
-# --- 6.7 ET0 mensual ---
 et0_month_long <- tbl_et0 %>%
   dplyr::group_by(Subcuenca, año, mes) %>%
   dplyr::summarise(et0_mon = sum(valor, na.rm = TRUE), .groups = "drop") %>%
   dplyr::mutate(fecha = as.Date(paste(año, mes, "01", sep = "-")))
 
-et0_month_resumen <- et0_month_long %>%
-  dplyr::select(fecha, Subcuenca, et0_mon) %>%
-  tidyr::pivot_wider(names_from = Subcuenca, values_from = et0_mon) %>%
-  dplyr::arrange(fecha)
+export_custom_format(.pivot_diario(et0_diaria_long), .out("et0_diaria"))
+write.csv(.pivot_mensual(et0_month_long, "et0_mon"), .out("et0_mensual"), row.names = FALSE)
+cat("💾 ET0 exportada a CSV.\n")
 
-cat("✅ Agregaciones completadas.\n")
-
-```
-
-Exportar
-```{r}
-############################################################
-# 7. Función de exportación custom (formato WEAP/DPL)
-############################################################
-
-export_custom_format <- function(df, file_path) {
-  # 1. Eliminar columnas auxiliares si existen
-  df <- df %>% dplyr::select(-any_of(c("año", "mes", "dia")))
-
-  # 2. Formatear la fecha como mm/dd/yyyy (primera columna)
-  df <- df %>%
-    mutate(across(1, ~ format(as.Date(.), "%m/%d/%Y")))
-
-  # 3. Encabezados personalizados
-  line1 <- paste0("#,", paste(seq_len(ncol(df) - 1), collapse = ","))
-  line2 <- paste0("$Columns = ", paste(names(df), collapse = ","))
-
-  # 4. Escribir encabezado
-  con <- file(file_path, "w", encoding = "UTF-8")
-  writeLines(c(line1, line2), con)
-  close(con)
-
-  # 5. Escribir datos (sin nombres, sin índice)
-  write.table(
-    df,
-    file_path,
-    sep       = ",",
-    row.names = FALSE,
-    col.names = FALSE,
-    quote     = FALSE,
-    append    = TRUE
-  )
-}
-
-############################################################
-# 8. Exportar resultados
-############################################################
-
-dir_out <- file.path(getwd(), "Results", cuenca_nombre)
-dir.create(dir_out, recursive = TRUE, showWarnings = FALSE)
-
-# Helper para construir paths de salida
-.out <- function(sufijo) {
-  file.path(dir_out, paste0(cuenca_nombre, "_", sufijo,
-                            "_cr2met2.5_", year_start_label, "_", year_end_label, ".csv"))
-}
-
-# Precipitación
-export_custom_format(pr_diaria_resumen,  .out("pp_diaria"))
-write.csv(pr_month_resumen,              .out("pp_mensual"),  row.names = FALSE)
-
-# Temperatura mínima
-export_custom_format(tmin_diaria_resumen, .out("tn_diaria"))
-write.csv(tmin_month_resumen,             .out("tn_mensual"), row.names = FALSE)
-
-# Temperatura máxima
-export_custom_format(tmax_diaria_resumen, .out("tx_diaria"))
-write.csv(tmax_month_resumen,             .out("tx_mensual"), row.names = FALSE)
-
-# Temperatura media
-export_custom_format(tmean_diaria_resumen, .out("tav_diaria"))
-write.csv(tmean_month_resumen,             .out("tav_mensual"), row.names = FALSE)
-
-# ET0
-export_custom_format(et0_diaria_resumen, .out("et0_diaria"))
-write.csv(et0_month_resumen,             .out("et0_mensual"), row.names = FALSE)
+# Limpiar caché vacía si no se mantiene
+if (!mantener_nc_cache) unlink(nc_cache_dir, recursive = TRUE)
 
 cat("✅ Exportación completada en:", dir_out, "\n")
 
 ```
+
+Nota: la agregación (diaria/mensual) y la exportación a CSV de cada variable
+se realizan dentro del bucle principal (chunk 5), inmediatamente después de
+terminar de procesar cada variable. Así, si el proceso se interrumpe, las
+variables ya completadas quedan guardadas en `Results/`.
