@@ -34,6 +34,12 @@ PP_FILE   = os.path.join(DATA_DIR, "Aconcagua_EmbCatemu_pp_diaria_cr2met2.5_1975
 TAV_FILE  = os.path.join(DATA_DIR, "Aconcagua_EmbCatemu_tav_diaria_cr2met2.5_1975_2026.csv")
 AREA_DBF  = os.path.join(WEAP_Directorio, "SIG", "Aconcagua_EmbCatemu_v2.dbf")
 
+PP_FILE_2   = os.path.join("Datos", "Clima_CR2Met_v2.5", "Aconcagua_EmbCatemu_pp_diaria_cr2met2.5_1975_2026.csv")
+TAV_FILE_2  = os.path.join("Datos", "Clima_CR2Met_v2.5", "Aconcagua_EmbCatemu_tav_diaria_cr2met2.5_1975_2026.csv")
+
+
+# DATA_DIR = "Datos\\" +  "Clima_CR2Met_v2.5\\"
+
 CATCHMENTS_ROOT = r"\Demand Sites and Catchments"
 AREA_SCALE = 1.0     # multiply area_ha by this (set to 0.01 if WEAP Area unit is km2)
 DRY_RUN = False       # <-- set to False to actually modify the model
@@ -134,10 +140,10 @@ def main():
                         b = weap.Branch(child_path)
                     existing.add(child_name)
 
-            pp_expr   = f'ReadFromFile("{PP_FILE}", "{label}")'
-            tav_expr  = f'ReadFromFile("{TAV_FILE}", "{label}")'
-            area_val  = area_by_label.get(label)
-            area_expr = "" if area_val is None else f"{area_val * AREA_SCALE:.6f}"
+            pp_expr   = f'ReadFromFile("{PP_FILE_2}", "{label}")'
+            tav_expr  = f'ReadFromFile("{TAV_FILE_2}", "{label}")'
+            area_val  = round(area_by_label.get(label),2)
+            area_expr = "" if area_val is None else f"{area_val * AREA_SCALE:.2f}"
 
             print(f"           Precipitation = {pp_expr}")
             print(f"           Temperature   = {tav_expr}")
@@ -145,13 +151,24 @@ def main():
 
             if not DRY_RUN:
                 if b is None:
-                    print(f"           [WARN] could not resolve branch, skipping variable assignment")
+                    print(f"           [WARN] branch object is None, skipping: {child_path}")
                     continue
-                b.Variables("Precipitation").Expression = pp_expr
-                b.Variables("Temperature").Expression   = tav_expr
+
+                # --- Asignar variables via WEAP.BranchVariable con backslash (igual que utils_Q.py) ---
+                childd = f"{child_path}"
+                bv_pp   = f"{child_path}:Precipitation"
+                bv_tav  = f"{child_path}:Temperature"
+                bv_area = f"{child_path}:Area"
+
+                print(f"           [DEBUG] trying: {bv_pp}")
+                WEAP.BranchVariable(bv_pp).Expression  = pp_expr
+                print(f"           [OK] Precipitation assigned")
+                WEAP.BranchVariable(bv_tav).Expression = tav_expr
+                print(f"           [OK] Temperature assigned")
                 if area_expr:
-                    b.Variables("Area").Unit = "Hectare"
-                    b.Variables("Area").Expression = area_expr
+                    # WEAP.BranchVariable(bv_area).Unit       = "Hectare"
+                    WEAP.BranchVariable(bv_area).Expression = area_expr
+                    print(f"           [OK] Area assigned")
 
     print("\n----- summary -----")
     print(f"branches to create : {created}")
