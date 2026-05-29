@@ -1,42 +1,46 @@
 """
-Create elevation-band sub-branches under existing WEAP catchments and wire each band's
-  - Precipitation  -> ReadFromFile() on the CR2Met daily pp CSV
-  - Temperature    -> ReadFromFile() on the CR2Met daily tav CSV
-  - Area           -> value (hectares) from the catchment shapefile attribute table
+Crea sub-ramas de banda de elevación bajo cada catchment existente en WEAP, y
+asigna a cada banda:
+  - Precipitation  -> ReadFromFile() sobre el CSV diario de pp de CR2Met
+  - Temperature    -> ReadFromFile() sobre el CSV diario de tav de CR2Met
+  - Area           -> valor (hectáreas) leído del shapefile (.dbf) del catchment
 
-Model: Aconcagua Embalse Catemu   |   Method: Rainfall Runoff (Soil Moisture)
-Timestep: weekly (WEAP aggregates the daily files by date: precip totaled, temp averaged)
+Modelo: Aconcagua Embalse Catemu   |   Método: Rainfall Runoff (Soil Moisture)
+Timestep weekly (WEAP agrega los CSV diarios por fecha automáticamente).
 
-Band labels (e.g. "Aconcagua en Blanco_2") are the common key across all three sources:
-they are the column labels in the CSVs and the 'Subcuenca' field in the DBF.
+Los labels de banda (p.ej. "Aconcagua en Blanco_2") son la llave común entre
+las tres fuentes (columna del CSV, campo Subcuenca del DBF, sub-rama en WEAP).
 
-Requirements: WEAP open on the target area; Python + pywin32.
-Run with DRY_RUN = True first to review, then set False to apply.
+Las rutas para los archivos LOCALES (que este script lee) son absolutas, construidas
+desde WEAP.AreasDirectory + ActiveArea.Name.
+Las rutas dentro de las expresiones ReadFromFile() son RELATIVAS al area
+directory -> el modelo queda portable.
 
-NOTE on Area units: the DBF field is 'area_ha' (hectares). Make sure the catchment
-Area variable's unit in WEAP is Hectare (or change AREA_SCALE below to convert).
+Requisitos: WEAP abierto en el area objetivo + Python con pywin32.
+Uso: DRY_RUN = True para revisar; False para aplicar y guardar.
 """
 
 import os
 import struct
 import win32com.client
-from pathlib import Path
 
 # ---------------------------------------------------------------- config
-import win32com.client
-WEAP      = win32com.client.Dispatch("WEAP.WEAPApplication")
-area_name = WEAP.ActiveArea.Name
+WEAP             = win32com.client.Dispatch("WEAP.WEAPApplication")
+area_name        = WEAP.ActiveArea.Name
 WEAP_Directorio  = WEAP.AreasDirectory + area_name
 
-# BASE      = r"C:\Users\David\Documents\GitHub_DPL\CR2Met_extraction"
 DATA_DIR  = os.path.join(WEAP_Directorio, "Datos", "Clima_CR2Met_v2.5")
 PP_FILE   = os.path.join(DATA_DIR, "Aconcagua_EmbCatemu_pp_diaria_cr2met2.5_1975_2026.csv")
 TAV_FILE  = os.path.join(DATA_DIR, "Aconcagua_EmbCatemu_tav_diaria_cr2met2.5_1975_2026.csv")
 AREA_DBF  = os.path.join(WEAP_Directorio, "SIG", "Aconcagua_EmbCatemu_v2.dbf")
 
+# Versiones relativas (lo que se escribe en las expresiones del modelo)
+PP_FILE_2   = os.path.join("Datos", "Clima_CR2Met_v2.5", "Aconcagua_EmbCatemu_pp_diaria_cr2met2.5_1975_2026.csv")
+TAV_FILE_2  = os.path.join("Datos", "Clima_CR2Met_v2.5", "Aconcagua_EmbCatemu_tav_diaria_cr2met2.5_1975_2026.csv")
+
 CATCHMENTS_ROOT = r"\Demand Sites and Catchments"
-AREA_SCALE = 1.0     # multiply area_ha by this (set to 0.01 if WEAP Area unit is km2)
-DRY_RUN = False       # <-- set to False to actually modify the model
+AREA_SCALE = 1.0     # multiplica area_ha por este factor (0.01 si la unidad WEAP es km2)
+DRY_RUN = False      # True = sólo imprime; False = aplica al modelo y guarda
 
 # ---------------------------------------------------------------- dbf reader
 def read_dbf(path):
@@ -99,20 +103,19 @@ def main():
         catch, band = split_label(label)
         catchments.setdefault(catch, []).append((band, label))
 
-    weap = win32com.client.Dispatch("WEAP.WEAPApplication")
-    print(f"Connected to WEAP. Active area: {weap.ActiveArea.Name}\n")
+    print(f"Connected to WEAP. Active area: {WEAP.ActiveArea.Name}\n")
 
     created = skipped = 0
     missing_catch = []
 
     for catch, bands in catchments.items():
         catch_path = f"{CATCHMENTS_ROOT}\\{catch}"
-        if not weap.BranchExists(catch_path):
+        if not WEAP.BranchExists(catch_path):
             missing_catch.append(catch)
             print(f"[MISSING] catchment not in model: {catch}")
             continue
 
-        parent = weap.Branch(catch_path)
+        parent = WEAP.Branch(catch_path)
         existing = {c.Name for c in parent.Children}
 
         for band, label in bands:
@@ -124,20 +127,21 @@ def main():
                 print(f"[exists]  {child_path}")
                 skipped += 1
                 if not DRY_RUN:
-                    b = weap.Branch(child_path)
+                    b = WEAP.Branch(child_path)
             else:
                 print(f"[create]  {child_path}")
                 created += 1
                 if not DRY_RUN:
                     b = parent.AddChild(child_name)
                     if b is None:
-                        b = weap.Branch(child_path)
+                        b = WEAP.Branch(child_path)
                     existing.add(child_name)
 
-            pp_expr   = f'ReadFromFile("{PP_FILE}", "{label}")'
-            tav_expr  = f'ReadFromFile("{TAV_FILE}", "{label}")'
+            pp_expr   = f'ReadFromFile("{PP_FILE_2}", "{label}")'
+            tav_expr  = f'ReadFromFile("{TAV_FILE_2}", "{label}")'
             area_val  = area_by_label.get(label)
-            area_expr = "" if area_val is None else f"{area_val * AREA_SCALE:.6f}"
+            area_val  = None if area_val is None else round(area_val, 2)
+            area_expr = None if area_val is None else f"{area_val * AREA_SCALE:.2f}"
 
             print(f"           Precipitation = {pp_expr}")
             print(f"           Temperature   = {tav_expr}")
@@ -145,13 +149,23 @@ def main():
 
             if not DRY_RUN:
                 if b is None:
-                    print(f"           [WARN] could not resolve branch, skipping variable assignment")
+                    print(f"           [WARN] branch object is None, skipping: {child_path}")
                     continue
-                b.Variables("Precipitation").Expression = pp_expr
-                b.Variables("Temperature").Expression   = tav_expr
+
+                # --- Asignar variables via WEAP.BranchVariable con backslash (igual que utils_Q.py) ---
+                bv_pp   = f"{child_path}:Precipitation"
+                bv_tav  = f"{child_path}:Temperature"
+                bv_area = f"{child_path}:Area"
+
+                print(f"           [DEBUG] trying: {bv_pp}")
+                WEAP.BranchVariable(bv_pp).Expression  = pp_expr
+                print(f"           [OK] Precipitation assigned")
+                WEAP.BranchVariable(bv_tav).Expression = tav_expr
+                print(f"           [OK] Temperature assigned")
                 if area_expr:
-                    b.Variables("Area").Unit = "Hectare"
-                    b.Variables("Area").Expression = area_expr
+                    # WEAP.BranchVariable(bv_area).Unit = "Hectare"   # no se puede setear via API
+                    WEAP.BranchVariable(bv_area).Expression = area_expr
+                    print(f"           [OK] Area assigned")
 
     print("\n----- summary -----")
     print(f"branches to create : {created}")
@@ -159,7 +173,7 @@ def main():
     print(f"catchments missing : {len(missing_catch)} {missing_catch if missing_catch else ''}")
     print(f"DRY_RUN = {DRY_RUN}  ({'no changes made' if DRY_RUN else 'changes applied'})")
     if not DRY_RUN:
-        weap.SaveArea()
+        WEAP.SaveArea()
         print("Area saved.")
 
 

@@ -35,10 +35,10 @@ getwd()
 ###########################################################################################
 ################## IMPORTANTE, LLENAR CON INFORMACION DE TU CUENCA ##################
 ###########################################################################################
-cuenca_nombre    <- "Aconcagua_EmbCatemu"       # nombre de la cuenca para el nombre de archivo
-archivo_shp      <- "Aconcagua_EmbCatemu.shp"
+cuenca_nombre    <- "LiguaPetorca"       # nombre de la cuenca para el nombre de archivo
+archivo_shp      <- "Subcuencas_RDM_LP_mejorado.shp"
 cuenca_shp       <- file.path(getwd(), "Cuenca", cuenca_nombre, archivo_shp)
-nombre_subcuenca <- "HRU"            # columna con el nombre de cada subcuenca
+nombre_subcuenca <- "Subcuenca"            # columna con el nombre de cada subcuenca
 
 # Rango temporal
 years_to_keep  <- 1975:2026
